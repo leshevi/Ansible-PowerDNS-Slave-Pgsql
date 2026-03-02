@@ -1,0 +1,18 @@
+pdns_zone_name: "domain"
+pdns_master_ip: "1.2.3.4"
+pdns_slave_ip: "1.2.3.4"
+pdns_project_root: "/opt/powerdns"
+
+# Настройки БД и API
+pdns_db_name: "powerdns"
+pdns_db_user: "powerdns"
+pdns_db_password: "password"
+pdns_api_key: "passwordkey"
+
+# Traefik и домен
+pdns_traefik_network: "proxy"
+pdns_domain: "pdns-slave.domain"
+
+# Telegram
+pdns_tg_token: ""
+pdns_tg_chat_id: "id пользователя или группы, не бота"

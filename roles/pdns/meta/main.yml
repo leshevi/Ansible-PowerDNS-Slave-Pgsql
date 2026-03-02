@@ -1,0 +1,14 @@
+---
+galaxy_info:
+  role_name: pdns
+  author: leshevi
+  description: A role for installing pdns
+  license: license (GPLv3, MIT, etc)
+  min_ansible_version: "2.9"
+  platforms:
+    - name: Debian
+      versions:
+        - bookworm
+  galaxy_tags:
+    - pdns
+dependencies: []

@@ -1,0 +1,270 @@
+---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install prerequisites
+  ansible.builtin.apt:
+    name:
+      - python3-psycopg2
+      - libpq-dev
+      - build-essential
+      - acl
+      - python3-docker
+      - ufw
+    state: present
+
+- name: Update Zone and Notify
+  when: inventory_hostname == "master_server"
+  block:
+    - name: Ensure NS and Glue records exist
+      ansible.builtin.command: "pdnsutil add-record {{ pdns_zone_name }} {{ item.name }} {{ item.type }} {{ item.content }}"
+      loop:
+        - { name: "@", type: "NS", content: "ns1.polzemli.ru" }
+        - { name: "@", type: "NS", content: "ns2.polzemli.ru" }
+        - { name: "ns1", type: "A", content: "{{ pdns_master_ip }}" }
+        - { name: "ns2", type: "A", content: "{{ pdns_slave_ip }}" }
+      register: pdns_master_fix
+      failed_when: false
+      changed_when: "'Added' in pdns_master_fix.stdout"
+
+    - name: Bump SOA Serial
+      ansible.builtin.command: "pdnsutil increase-serial {{ pdns_zone_name }}"
+      register: pdns_master_bump
+      changed_when: "'Updated' in pdns_master_bump.stdout"
+
+    - name: Get Current Serial for sync check
+      ansible.builtin.shell: |
+        set -o pipefail
+        pdnsutil list-zone {{ pdns_zone_name }} | grep SOA | awk '{print $6}'
+      args:
+        executable: /bin/bash
+      register: pdns_master_serial
+      changed_when: false
+
+    - name: Send Notify to Slave
+      ansible.builtin.command: "pdns_control notify {{ pdns_zone_name }}"
+      changed_when: false
+
+# ==========================================
+# БЛОК 2: ПОДГОТОВКА СЛЕЙВА (DOCKER)
+# ==========================================
+- name: Infrastructure Setup
+  when: inventory_hostname == "slave_server"
+  block:
+    - name: Fix Port 53 conflict (systemd-resolved)
+      block:
+        - name: Stop systemd
+          ansible.builtin.systemd:
+            name: systemd-resolved
+            state: stopped
+            enabled: false
+
+        - name: Create file
+          ansible.builtin.file:
+            path: /etc/resolv.conf
+            state: absent
+            mode: "0644"
+
+        - name: Copy file
+          ansible.builtin.copy:
+            dest: /etc/resolv.conf
+            content: "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+            mode: '0644'
+
+    - name: Create Directories and set Permissions (UID 999 for Postgres)
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default('root') }}"
+        mode: "{{ item.mode | default('0755') }}"
+      loop:
+        - { path: "{{ pdns_project_root }}/config" }
+        - { path: "{{ pdns_project_root }}/db_data", owner: "999", mode: "0700" }
+
+    - name: Configure Firewall (UFW)
+      community.general.ufw:
+        rule: allow
+        port: "{{ item }}"
+      loop: ['53', '80', '443']
+
+    - name: Generate PDNS Config from Template
+      ansible.builtin.template:
+        src: templates/pdns.conf.j2
+        dest: "{{ pdns_project_root }}/config/pdns.conf"
+        mode: "0644"
+      register: pdns_slave_conf
+
+    - name: Run PostgreSQL with Log Rotation
+      community.docker.docker_container:
+        name: pgsql
+        etc_hosts:
+          pgsql: "172.19.0.15"
+        image: postgres:15-alpine
+        restart_policy: always
+        networks:
+          - name: "{{ pdns_traefik_network }}"
+            ipv4_address: "172.19.0.15"
+        env: { POSTGRES_DB: "{{ pdns_db_name }}", POSTGRES_USER: "{{ pdns_db_user }}", POSTGRES_PASSWORD: "{{ pdns_db_password }}" }
+        volumes:
+          - "{{ pdns_project_root }}/db_data:/var/lib/postgresql/data:Z"
+          - /etc/localtime:/etc/localtime:ro
+        log_driver: "json-file"
+        log_options: { max-size: "10m", max-file: "3" }
+        command: [
+          "postgres",
+          "-c", "password_encryption=md5",  # Ключевое исправление
+          "-c", "log_rotation_age=1440",
+          "-c", "log_rotation_size=10MB"
+        ]
+
+    - name: Wait for PostgreSQL to be ready
+      community.docker.docker_container_exec:
+        container: pgsql
+        command: pg_isready -h localhost -U {{ pdns_db_user }} -d {{ pdns_db_name }}
+      register: pdns_db_ready
+      until: pdns_db_ready.rc == 0
+      retries: 10
+      delay: 3
+      failed_when: false
+
+    - name: Initialize Schema (If missing)
+      community.docker.docker_container_exec:
+        container: pgsql
+        command: >
+          psql -U {{ pdns_db_user }} -d {{ pdns_db_name }} -tAc "SELECT count(*) FROM domains;"
+      register: pdns_table_check
+      ignore_errors: true
+
+    - name: Copy schema.sql
+      ansible.builtin.copy:
+        src: files/pdns-schema.sql
+        dest: /tmp/schema.sql
+        mode: '0644'
+        owner: "999"
+
+    - name: Debug rc value
+      ansible.builtin.debug:
+        var: pdns_table_check.rc
+
+    - name: Copy schema.sql and set permissions
+      community.docker.docker_container_copy_into:
+        container: pgsql
+        path: /tmp/schema.sql
+        container_path: /tmp/schema.sql
+      when: pdns_table_check.rc == 1
+
+    - name: Import PowerDNS SQL Schema
+      community.docker.docker_container_exec:
+        container: pgsql
+        command: psql -U {{ pdns_db_user }} -d {{ pdns_db_name }} -f /tmp/schema.sql
+      when: pdns_table_check.rc == 1  # Если запрос выше ничего не вернул
+
+    - name: Run PowerDNS Slave Container
+      community.docker.docker_container:
+        name: pdns-slave
+        image: pschiffe/pdns-pgsql
+        restart_policy: always
+        recreate: "{{ pdns_slave_conf.changed }}"
+        networks: [{name: "{{ pdns_traefik_network }}"}]
+        volumes: ["{{ pdns_project_root }}/config/pdns.conf:/etc/pdns/pdns.conf:ro"]
+        ports: ["53:53/udp", "53:53/tcp"]
+        env:
+          USE_EXISTING_CONFIG_FILE: "true"
+          SKIP_DB_CREATE: "true"
+          PGUSER: "{{ pdns_db_user }}"
+          PGPASSWORD: "{{ pdns_db_password }}"
+          PGDATABASE: "{{ pdns_db_name }}"
+          PDNS_GPGSQL_HOST: "pgsql"
+        labels:
+          traefik.enable: "true"
+          traefik.http.routers.pdns.rule: "Host(`{{ pdns_domain }}`)"
+          traefik.http.services.pdns.loadbalancer.server.port: "8081"
+          traefik.docker.network: "{{ pdns_traefik_network }}"
+
+        healthcheck:
+          test: ["CMD-SHELL", "cat < /dev/null > /dev/tcp/127.0.0.1/53"]
+
+    - name: Check if Master is already registered
+      community.docker.docker_container_exec:
+        container: pgsql
+        command: >
+          psql -U {{ pdns_db_user }} -d {{ pdns_db_name }} -tAc "SELECT * FROM supermasters;"
+      register: pdns_zone_check
+      ignore_errors: true
+
+    - name: Debug rc value
+      ansible.builtin.debug:
+        var: pdns_zone_check.rc
+
+    - name: Register Master as Supermaster in DB
+      community.docker.docker_container_exec:
+        container: pgsql
+        command: >
+          psql -U {{ pdns_db_user }} -d {{ pdns_db_name }} -c "
+          SELECT * FROM supermasters;
+          UPDATE domains SET type='SECONDARY' WHERE name='{{ pdns_zone_name }}';
+          SELECT name, type, content FROM records WHERE domain_id=(SELECT id FROM domains WHERE name='{{ pdns_zone_name }}');
+          INSERT INTO domains (name, type, master) VALUES ('{{ pdns_zone_name }}', 'SECONDARY', '{{ pdns_master_ip }}');
+          UPDATE domains SET type = 'SLAVE' WHERE type = 'SECONDARY';
+          "
+      when: pdns_zone_check.rc == 0
+
+    - name: Clear the cache and kick the server
+      community.docker.docker_container_exec:
+        container: pdns-slave
+        command: "pdns_control retrieve {{ pdns_zone_name }}"
+      when: pdns_zone_check.rc == 0
+
+# ==========================================
+# БЛОК 3: ПРОВЕРКА СИНХРОНИЗАЦИИ И SSL
+# ==========================================
+- name: Validation and Alerts
+  when: inventory_hostname == "slave_server"
+  block:
+    - name: Wait 5 minutes
+      ansible.builtin.pause:
+        seconds: 300
+
+    - name: Wait for DNS Sync (Compare Serials)
+      ansible.builtin.command: "dig SOA {{ pdns_zone_name }} @127.0.0.1 +short"
+      register: pdns_sync_check
+      until: pdns_sync_check.stdout != ""
+      retries: 10
+      delay: 5
+      ignore_errors: true
+      changed_when: false
+
+    - name: Check HTTPS and SSL Certificate
+      ansible.builtin.uri:
+        url: "https://{{ pdns_domain }}/api/v1/servers/localhost/statistics"
+        headers: { X-API-Key: "{{ pdns_api_key }}" }
+      register: pdns_https_check
+      until: pdns_https_check.status == 200 or pdns_https_check.status == 401
+      retries: 10
+      delay: 10
+      ignore_errors: true
+
+    - name: Get Disk Usage
+      ansible.builtin.shell: |
+        set -o pipefail # <-- adding this will prevent surprises
+        df -h {{ pdns_project_root }} | awk 'NR==2 {print $5}'
+      args:
+        executable: /bin/bash
+      register: pdns_disk_usage
+      changed_when: false
+
+    - name: Send Telegram Status
+      community.general.telegram:
+        token: "{{ pdns_tg_token }}"
+        api_args:
+          chat_id: "{{ pdns_tg_chat_id }}"
+          parse_mode: html
+          text: |
+            <b>{% if pdns_sync_check.failed %}❌ DNS Sync FAILED{% else %}✅ DNS Sync SUCCESS{% endif %}</b>
+            <b>Zone:</b> <code>{{ pdns_zone_name }}</code>
+            <b>Master Serial:</b> <code>{{ hostvars['master_server']['pdns_master_serial']['stdout'] }}</code>
+            <b>Master Serial:</b> <code>{{ pdns_sync_check.stdout | default('N/A') | escape }}</code>
+            💾 <b>Disk Usage:</b> <code>{{ pdns_disk_usage.stdout | escape }}</code>
+            🛡️ <b>SSL:</b> <code>{% if pdns_https_check.failed %}⚠️ Error{% else %}🔒 Valid{% endif %}</code>

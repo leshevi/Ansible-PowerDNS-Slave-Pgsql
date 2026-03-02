@@ -1,0 +1,6 @@
+- name: Deploy PostgreSQL and PowerDNS Slave in the same Docker network
+  hosts: all
+  gather_facts: true
+  become: true
+  roles:
+    - pdns

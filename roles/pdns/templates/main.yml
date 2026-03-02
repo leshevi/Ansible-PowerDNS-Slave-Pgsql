@@ -1,0 +1,31 @@
+# Базовые настройки
+launch=gpgsql
+daemon=no
+guardian=no
+loglevel=4
+
+# Соединение с PostgreSQL (внутри Docker сети)
+gpgsql-host=pgsql
+gpgsql-port=5432
+gpgsql-user={{ pdns_db_user }}
+gpgsql-dbname={{ pdns_db_name }}
+gpgsql-password={{ pdns_db_password }}
+
+# Режим Slave (Secondary)
+version-string=anonymous
+secondary=yes
+autosecondary=yes
+allow-notify-from={{ pdns_master_ip }}/32
+allow-axfr-ips={{ pdns_master_ip }}/32
+
+# API и Web-сервер для Traefik
+webserver=yes
+webserver-address=0.0.0.0
+webserver-allow-from=0.0.0.0/0
+webserver-port=8081
+api=yes
+api-key={{ pdns_api_key }}
+
+# Слушаем DNS на всех интерфейсах контейнера
+local-address=0.0.0.0
+local-port=53
